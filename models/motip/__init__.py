@@ -1,10 +1,10 @@
 # Copyright (c) Ruopeng Gao. All Rights Reserved.
 
 from .motip import MOTIP
+from .trajectory_modeling_with_motion import TrajectoryModelingWithMotion
+from .id_decoder_with_motion import IDDecoderWithMotion
 from structures.args import Args
 from models.deformable_detr.deformable_detr import build as build_deformable_detr
-from models.motip.trajectory_modeling import TrajectoryModeling
-from models.motip.id_decoder import IDDecoder
 
 
 def build(config: dict):
@@ -49,15 +49,19 @@ def build(config: dict):
 
     # Build each component:
     # 1. trajectory modeling (currently, only FFNs are used):
-    _trajectory_modeling = TrajectoryModeling(
+    _trajectory_modeling = TrajectoryModelingWithMotion(
         detr_dim=config["DETR_HIDDEN_DIM"],
         ffn_dim_ratio=config["FFN_DIM_RATIO"],
         feature_dim=config["FEATURE_DIM"],
+        motion_dim=config.get("MOTION_DIM", 128),
+        use_kalman=config.get("USE_KALMAN_FILTER", True),
     ) if config["ONLY_DETR"] is False else None
+
     # 2. ID decoder:
-    _id_decoder = IDDecoder(
+    _id_decoder = IDDecoderWithMotion(
         feature_dim=config["FEATURE_DIM"],
         id_dim=config["ID_DIM"],
+        motion_dim=config.get("MOTION_DIM", 128),
         ffn_dim_ratio=config["FFN_DIM_RATIO"],
         num_layers=config["NUM_ID_DECODER_LAYERS"],
         head_dim=config["HEAD_DIM"],
@@ -65,6 +69,7 @@ def build(config: dict):
         rel_pe_length=config["REL_PE_LENGTH"],
         use_aux_loss=config["USE_AUX_LOSS"],
         use_shared_aux_head=config["USE_SHARED_AUX_HEAD"],
+        motion_weight=config.get("MOTION_WEIGHT", 0.5),
     ) if config["ONLY_DETR"] is False else None
 
     # Construct MOTIP model:

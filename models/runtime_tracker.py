@@ -177,7 +177,6 @@ class RuntimeTracker:
 
         # Filter out inactive tracks:
         self._filter_out_inactive_tracks()
-        pass
         return
 
     def _get_id_pred_labels_with_motion(self, boxes: torch.Tensor, output_embeds: torch.Tensor):
@@ -228,8 +227,29 @@ class RuntimeTracker:
             # 5. Motion-aware assignment
             if hasattr(self, 'trajectory_velocities') and self.trajectory_velocities.shape[0] > 0:
                 # Adjust scores based on motion consistency
-                motion_consistency_scores = self._compute_motion_consistency(boxes)
-                id_scores = id_scores * (1 - self.motion_weight) + motion_consistency_scores * self.motion_weight
+                motion_consistency_scores = self._compute_motion_consistency(boxes) # Shape: (N_det, N_active_tracks_in_traj + 1)
+                
+                motion_adjustment_for_id_scores = torch.zeros_like(id_scores) # Shape: (N_det, num_id_vocabulary + 1)
+
+                N_active_tracks_in_traj = 0
+                if self.trajectory_id_labels.nelement() > 0 and self.trajectory_id_labels.shape[1] > 0:
+                    active_track_id_labels = self.trajectory_id_labels[-1]  # Shape: (N_active_tracks_in_traj,)
+                    N_active_tracks_in_traj = active_track_id_labels.shape[0]
+                    
+                    # Populate scores for active tracks
+                    for det_idx in range(boxes.shape[0]): # N_det loop
+                        for i in range(N_active_tracks_in_traj):
+                            track_label_from_history = active_track_id_labels[i].item()
+                            if track_label_from_history < self.num_id_vocabulary: # Ensure ID is a valid index for id_scores
+                                if i < motion_consistency_scores.shape[1] -1: # Ensure we don't go out of bounds for motion_consistency_scores track columns
+                                     motion_adjustment_for_id_scores[det_idx, track_label_from_history] = motion_consistency_scores[det_idx, i]
+                
+                # Populate scores for the newborn class
+                # The newborn column in motion_consistency_scores is at index N_active_tracks_in_traj
+                if motion_consistency_scores.shape[1] > N_active_tracks_in_traj: # Check if newborn column exists
+                    motion_adjustment_for_id_scores[:, self.num_id_vocabulary] = motion_consistency_scores[:, N_active_tracks_in_traj]
+                
+                id_scores = id_scores * (1 - self.motion_weight) + motion_adjustment_for_id_scores * self.motion_weight
             
             # 6. assign id labels:
             match self.assignment_protocol:
@@ -368,9 +388,10 @@ class RuntimeTracker:
             )
             # 3. make sure these id labels are not in trajectory infos:
             trajectory_remove_idxs = torch.zeros(
-                self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.nelement() > 0 else 0, 
+                self.trajectory_id_labels.shape[1], # Corrected: Use shape[1] directly
                 dtype=torch.bool, device=distributed_device(),
             )
+
             if self.trajectory_id_labels.shape[0] > 0 and self.trajectory_id_labels.shape[1] > 0 : # Check if trajectories exist
                 for _ in range(len(newborn_id_labels)):
                     trajectory_remove_idxs |= (self.trajectory_id_labels[0] == newborn_id_labels[_])
@@ -400,7 +421,9 @@ class RuntimeTracker:
             # 5. update id infos:
             for _ in range(len(newborn_id_labels)):
                 self.id_label_to_id[newborn_id_labels[_].item()] = self.next_id
-                self.id_queue.discard(newborn_id_labels[_].item()) # Remove from available pool
+                item_to_remove = newborn_id_labels[_].item()
+                if item_to_remove in self.id_queue.dict: # Check in the underlying dict
+                    del self.id_queue.dict[item_to_remove] # Delete from the underlying dict
                 self.next_id += 1
 
             return pred_id_labels
@@ -477,7 +500,7 @@ class RuntimeTracker:
                          self.trajectory_accelerations = torch.cat([self.trajectory_accelerations, _new_accelerations_hist], dim=1)
 
 
-        _N_total_tracks = self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.nelement() > 0 else 0
+        _N_total_tracks = self.trajectory_id_labels.shape[1]
         
         if self.trajectory_id_labels.shape[0] > 0 and _N_total_tracks > 0:
             current_id_labels_for_new_frame = self.trajectory_id_labels[-1].clone() 
@@ -493,82 +516,121 @@ class RuntimeTracker:
         current_times_for_new_frame = new_time_step_val * torch.ones((_N_total_tracks,), dtype=torch.int64, device=distributed_device())
         current_masks_for_new_frame = torch.ones((_N_total_tracks,), dtype=torch.bool, device=distributed_device()) # Assume all masked initially for this new frame
 
+        # Update current_masks_for_new_frame for tracks that are active in the current frame (present in id_labels)
+        if _N_total_tracks > 0 and id_labels.numel() > 0:
+            # Create a boolean tensor indicating which of the current frame's id_labels are present in current_id_labels_for_new_frame
+            # This means finding where current_id_labels_for_new_frame matches any of the id_labels
+            for i, track_id_in_history_slot in enumerate(current_id_labels_for_new_frame):
+                if (track_id_in_history_slot == id_labels).any():
+                    current_masks_for_new_frame[i] = False
 
-        if _N_total_tracks > 0 and id_labels.numel() > 0 : 
-            indices = torch.eq(current_id_labels_for_new_frame[:, None], id_labels[None, :]).nonzero(as_tuple=False)
-            
-            if indices.numel() > 0:
-                track_indices_to_update = indices[:, 0] 
-                detection_indices = indices[:, 1]       
-            
-                current_id_labels_for_new_frame[track_indices_to_update] = id_labels[detection_indices] 
-                current_features_for_new_frame[track_indices_to_update] = output_embeds[detection_indices]
-                current_boxes_for_new_frame[track_indices_to_update] = boxes[detection_indices]
-                current_masks_for_new_frame[track_indices_to_update] = False 
+        if _N_total_tracks > 0: # Ensure there are tracks to update
+            # Prepare current frame data with a time dimension
+            current_features_t = current_features_for_new_frame.unsqueeze(0)
+            current_boxes_t = current_boxes_for_new_frame.unsqueeze(0)
+            current_id_labels_t = current_id_labels_for_new_frame.unsqueeze(0)
+            current_times_t = current_times_for_new_frame.unsqueeze(0)
+            current_masks_t = current_masks_for_new_frame.unsqueeze(0)
 
-        if self.trajectory_features.nelement() == 0 and _N_total_tracks > 0 : 
-            self.trajectory_features = current_features_for_new_frame[None, ...]
-            self.trajectory_boxes = current_boxes_for_new_frame[None, ...]
-            self.trajectory_id_labels = current_id_labels_for_new_frame[None, ...]
-            self.trajectory_times = current_times_for_new_frame[None, ...]
-            self.trajectory_masks = current_masks_for_new_frame[None, ...]
-        elif _N_total_tracks > 0 : 
-            self.trajectory_features = torch.cat([self.trajectory_features, current_features_for_new_frame[None, ...]], dim=0).contiguous()
-            self.trajectory_boxes = torch.cat([self.trajectory_boxes, current_boxes_for_new_frame[None, ...]], dim=0).contiguous()
-            self.trajectory_id_labels = torch.cat([self.trajectory_id_labels, current_id_labels_for_new_frame[None, ...]], dim=0).contiguous()
-            self.trajectory_times = torch.cat([self.trajectory_times, current_times_for_new_frame[None, ...]], dim=0).contiguous()
-            self.trajectory_masks = torch.cat([self.trajectory_masks, current_masks_for_new_frame[None, ...]], dim=0).contiguous()
+            if self.trajectory_id_labels.shape[0] == 0:
+                # History time dim is 0 (shape is (0, _N_total_tracks)).
+                # New history is just the current frame's data.
+                self.trajectory_features = current_features_t.clone().contiguous()
+                self.trajectory_boxes = current_boxes_t.clone().contiguous()
+                self.trajectory_id_labels = current_id_labels_t.clone().contiguous()
+                self.trajectory_times = current_times_t.clone().contiguous()
+                self.trajectory_masks = current_masks_t.clone().contiguous()
+            else:
+                # History is (T_old, _N_total_tracks) where T_old > 0. Append current frame.
+                self.trajectory_features = torch.cat([self.trajectory_features, current_features_t], dim=0).contiguous()
+                self.trajectory_boxes = torch.cat([self.trajectory_boxes, current_boxes_t], dim=0).contiguous()
+                self.trajectory_id_labels = torch.cat([self.trajectory_id_labels, current_id_labels_t], dim=0).contiguous()
+                self.trajectory_times = torch.cat([self.trajectory_times, current_times_t], dim=0).contiguous()
+                self.trajectory_masks = torch.cat([self.trajectory_masks, current_masks_t], dim=0).contiguous()
+        # Else: _N_total_tracks is 0, trajectories remain empty or as they were.
 
+        # 4.4. Update motion information if using motion
         if self.use_motion and self.trajectory_boxes.shape[0] > 0 and self.trajectory_boxes.shape[1] > 0: 
+            # This block ensures trajectory_velocities and _accelerations are initialized or re-calculated
+            # if their shapes are inconsistent (e.g. after tracks are filtered/added, or first time).
+            # It aims to make them T_box or T_box-1 in time dimension.
             if not hasattr(self, 'trajectory_velocities') or \
                self.trajectory_velocities.shape[1] != self.trajectory_boxes.shape[1] or \
-               self.trajectory_velocities.shape[0] != self.trajectory_boxes.shape[0]-1: 
+               (self.trajectory_velocities.shape[0] != self.trajectory_boxes.shape[0] and \
+                self.trajectory_velocities.shape[0] != self.trajectory_boxes.shape[0]-1) : # Allow T_vel to be T_box or T_box-1
                 
-                if not hasattr(self, 'trajectory_velocities') or self.trajectory_velocities.shape[1] != self.trajectory_boxes.shape[1]:
-                    self.trajectory_velocities = torch.zeros_like(self.trajectory_boxes)
-                    self.trajectory_accelerations = torch.zeros_like(self.trajectory_boxes)
-                    if self.trajectory_boxes.shape[0] > 1:
-                        for t_idx in range(1, self.trajectory_boxes.shape[0]):
-                            valid_prev = ~self.trajectory_masks[t_idx-1]
-                            valid_curr = ~self.trajectory_masks[t_idx]
-                            valid_both = valid_prev & valid_curr
-                            if valid_both.any():
-                                self.trajectory_velocities[t_idx, valid_both] = (self.trajectory_boxes[t_idx, valid_both] - self.trajectory_boxes[t_idx-1, valid_both])
-                        if self.trajectory_boxes.shape[0] > 2: 
-                             for t_idx in range(2, self.trajectory_boxes.shape[0]):
-                                valid_vel_curr = ~self.trajectory_masks[t_idx] 
-                                valid_vel_prev = ~self.trajectory_masks[t_idx-1]
-                                valid_both_vel = valid_vel_curr & valid_vel_prev # If both points for vel_curr are valid, and both for vel_prev
-                                if valid_both_vel.any():
-                                     self.trajectory_accelerations[t_idx, valid_both_vel] = (self.trajectory_velocities[t_idx, valid_both_vel] - self.trajectory_velocities[t_idx-1, valid_both_vel])
+                # Initialize to T_box, then calculate values. Zeros for first frame vel/accel is fine.
+                self.trajectory_velocities = torch.zeros_like(self.trajectory_boxes)
+                self.trajectory_accelerations = torch.zeros_like(self.trajectory_boxes)
+                if self.trajectory_boxes.shape[0] > 1: # Need at least 2 box states for velocity
+                    for t_idx in range(1, self.trajectory_boxes.shape[0]):
+                        valid_prev = ~self.trajectory_masks[t_idx-1]
+                        valid_curr = ~self.trajectory_masks[t_idx]
+                        valid_both = valid_prev & valid_curr
+                        if valid_both.any():
+                            self.trajectory_velocities[t_idx, valid_both] = (self.trajectory_boxes[t_idx, valid_both] - self.trajectory_boxes[t_idx-1, valid_both])
+                    if self.trajectory_boxes.shape[0] > 2: # Need at least 2 velocity states (implies 3 box states) for acceleration
+                         for t_idx in range(2, self.trajectory_boxes.shape[0]): # t_idx for accel corresponds to t_idx for vel_curr
+                            # valid_vel_curr requires points at t_idx and t_idx-1 to be unmasked for boxes
+                            # valid_vel_prev requires points at t_idx-1 and t_idx-2 to be unmasked for boxes
+                            # For simplicity, use masks directly on velocity arrays (which should be T_box)
+                            # This re-calculation assumes velocities up to t_idx-1 are already computed.
+                            valid_vel_curr_points = (~self.trajectory_masks[t_idx]) & (~self.trajectory_masks[t_idx-1])
+                            valid_vel_prev_points = (~self.trajectory_masks[t_idx-1]) & (~self.trajectory_masks[t_idx-2])
+                            valid_for_accel = valid_vel_curr_points & valid_vel_prev_points
 
+                            if valid_for_accel.any():
+                                 self.trajectory_accelerations[t_idx, valid_for_accel] = (self.trajectory_velocities[t_idx, valid_for_accel] - self.trajectory_velocities[t_idx-1, valid_for_accel])
 
+            # Calculate current velocities and accelerations for the newest time step
             current_velocities_for_new_frame = torch.zeros((_N_total_tracks, 4), dtype=self.dtype, device=distributed_device())
-            if self.trajectory_boxes.shape[0] > 1: 
-                valid_prev = ~self.trajectory_masks[-2]
-                valid_curr = ~self.trajectory_masks[-1] 
+            if self.trajectory_boxes.shape[0] > 1: # If there's at least one previous box state
+                valid_prev = ~self.trajectory_masks[-2] # Mask of T-2
+                valid_curr = ~self.trajectory_masks[-1] # Mask of T-1 (latest boxes)
                 valid_both = valid_prev & valid_curr
                 if valid_both.any():
                     current_velocities_for_new_frame[valid_both] = (self.trajectory_boxes[-1][valid_both] - \
                                                                   self.trajectory_boxes[-2][valid_both])
             
             current_accelerations_for_new_frame = torch.zeros((_N_total_tracks, 4), dtype=self.dtype, device=distributed_device())
-            if self.trajectory_velocities.shape[0] > 0 and self.trajectory_boxes.shape[0] > 1: 
-                valid_vel_prev_frame = ~self.trajectory_masks[-2] 
-                valid_vel_curr_frame = ~self.trajectory_masks[-1] 
-                valid_for_accel = valid_vel_prev_frame & valid_vel_curr_frame 
+            # Need at least two velocity states to compute current acceleration.
+            # self.trajectory_velocities[-1] would be velocity at T-1 (from boxes T-1 and T-2)
+            # current_velocities_for_new_frame is velocity at T (from boxes T and T-1)
+            if self.trajectory_velocities.shape[0] > 0 and self.trajectory_boxes.shape[0] > 1:
+                # Ensure masks align with how velocities were computed
+                # Velocity at T-1 (self.trajectory_velocities[-1]) depends on boxes at T-1 and T-2.
+                # Velocity at T (current_velocities_for_new_frame) depends on boxes at T and T-1.
+                # To compute acceleration at T, we need valid velocities at T and T-1.
+                valid_vel_at_T_minus_1_points = (~self.trajectory_masks[-2]) & (~self.trajectory_masks[-3] if self.trajectory_boxes.shape[0] > 2 else ~self.trajectory_masks[-2])
+                valid_vel_at_T_points = (~self.trajectory_masks[-1]) & (~self.trajectory_masks[-2])
+                valid_for_accel = valid_vel_at_T_minus_1_points & valid_vel_at_T_points
+
                 if valid_for_accel.any():
-                    prev_velocities = self.trajectory_velocities[-1, valid_for_accel] 
+                    # Get previously stored velocities for T-1 (which is the last entry in self.trajectory_velocities if its T dim is T_box)
+                    # Or it could be T_box-1. The recalculation block above should make it T_box.
+                    prev_velocities = self.trajectory_velocities[-1, valid_for_accel]
                     curr_velocities_subset = current_velocities_for_new_frame[valid_for_accel]
                     current_accelerations_for_new_frame[valid_for_accel] = curr_velocities_subset - prev_velocities
 
-            if self.trajectory_velocities.shape[0] == self.trajectory_boxes.shape[0]:
-                self.trajectory_velocities[-1] = current_velocities_for_new_frame
+            # Unsqueeze current frame motion data to have a time dimension
+            current_velocities_t = current_velocities_for_new_frame.unsqueeze(0)
+            current_accelerations_t = current_accelerations_for_new_frame.unsqueeze(0)
+            
+            # Update or append motion history
+            # After the re-initialization block, self.trajectory_velocities.shape[0] should be self.trajectory_boxes.shape[0].
+            # So, we are always updating the last slot.
+            if self.trajectory_velocities.shape[0] == self.trajectory_boxes.shape[0] and self.trajectory_boxes.shape[0] > 0:
+                self.trajectory_velocities[-1] = current_velocities_for_new_frame # Assign (N,4) to (N,4) slice
                 self.trajectory_accelerations[-1] = current_accelerations_for_new_frame
-            else: # Append if history was shorter (e.g. T-1)
-                self.trajectory_velocities = torch.cat([self.trajectory_velocities, current_velocities_for_new_frame[None, ...]], dim=0).contiguous()
-                self.trajectory_accelerations = torch.cat([self.trajectory_accelerations, current_accelerations_for_new_frame[None, ...]], dim=0).contiguous()
- 
+            elif self.trajectory_velocities.shape[0] == 0 and self.trajectory_boxes.shape[0] > 0 : # Should be T_box = 1
+                # This case handles if velocities were (0,N,4) and boxes are (1,N,4)
+                self.trajectory_velocities = current_velocities_t.clone().contiguous()
+                self.trajectory_accelerations = current_accelerations_t.clone().contiguous()
+            elif self.trajectory_velocities.shape[0] < self.trajectory_boxes.shape[0] and self.trajectory_boxes.shape[0] > 0:
+                 # This case implies T_vel = T_box - 1. Append.
+                self.trajectory_velocities = torch.cat([self.trajectory_velocities, current_velocities_t], dim=0).contiguous()
+                self.trajectory_accelerations = torch.cat([self.trajectory_accelerations, current_accelerations_t], dim=0).contiguous()
+
         # 4.5. a hack implementation to fix "times":
         if self.trajectory_times.nelement() > 0 :
             self.trajectory_times = einops.repeat(

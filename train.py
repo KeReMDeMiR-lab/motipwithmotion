@@ -6,6 +6,7 @@ import torch
 import einops
 from accelerate import Accelerator
 from accelerate.state import PartialState
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
@@ -36,7 +37,8 @@ def train_engine(config: dict):
         else os.path.join("./outputs/", config["EXP_NAME"])
 
     # Init Accelerator at beginning:
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     state = PartialState()
     # Also, we set the seed:
     set_seed(config["SEED"])
@@ -665,6 +667,8 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
     trajectory_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
     trajectory_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
     trajectory_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
+    trajectory_motion_features = torch.zeros((_B, _G, _T, _N, 128), dtype=torch.float32, device=_device)
+    unknown_motion_features = torch.zeros((_B, _G, _T, _N, 128), dtype=torch.float32, device=_device)
     unknown_id_labels = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
     unknown_times = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
     unknown_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
@@ -702,6 +706,8 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
         "trajectory_masks": trajectory_masks,
         "trajectory_boxes": trajectory_boxes,
         "trajectory_features": trajectory_features,
+        "trajectory_motion_features": trajectory_motion_features,
+        "unknown_motion_features": unknown_motion_features,
         "unknown_id_labels": unknown_id_labels,
         "unknown_times": unknown_times,
         "unknown_masks": unknown_masks,

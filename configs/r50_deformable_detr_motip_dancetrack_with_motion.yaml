@@ -1,0 +1,15 @@
+# configs/r50_deformable_detr_motip_dancetrack_with_motion.yaml
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_dancetrack.yaml
+
+# Motion modeling parameters
+MOTION_DIM: 128
+USE_KALMAN_FILTER: True
+MOTION_WEIGHT: 0.5
+
+# Adjust training parameters for motion modeling
+EPOCHS: 12  # Slightly more epochs for motion learning
+LR: 1.0e-4
+SCHEDULER_MILESTONES: [7, 10]
+
+# Motion loss weight
+MOTION_LOSS_WEIGHT: 0.3
